@@ -961,13 +961,11 @@ removePackageInternal(Package *package)
 	GetPackState(package)->trans_var_num = 0;
 }
 
+/* Check if package has any valid variables */
 static bool
 isPackageEmpty(Package *package)
 {
-	int var_num = 0;
-	
-	if (package->varHashTransact)
-		var_num += hash_get_num_entries(package->varHashTransact);
+	int var_num = GetPackState(package)->trans_var_num;
 
 	if (package->varHashRegular)
 		var_num += hash_get_num_entries(package->varHashRegular);
@@ -1779,17 +1777,35 @@ rollbackSavepoint(TransObject *object, TransObjectType type)
 	state = GetActualState(object);
 	removeState(object, type, state);
 
+	/* If there is no more states... */
 	if (dlist_is_empty(&object->states))
 	{
+		/* ...but object is a package and has some regular variables... */
 		if (type == TRANS_PACKAGE && numOfRegVars((Package *)object) > 0)
 		{
+			/* ...create a new state to make package valid. */
 			initObjectHistory(object, type);
 			GetActualState(object)->level = GetCurrentTransactionNestLevel() - 1;
 			if (!dlist_is_empty(changesStack))
 				addToChangesStackUpperLevel(object, type);
 		}
 		else
+			/* ...or remove an object if it is no longer needed. */
 			removeObject(object, type);
+	}
+	/* 
+	 * But if a package has more states, but hasn't valid variables,
+	 * mark it as not valid.
+	 */
+	else if (type == TRANS_PACKAGE && isPackageEmpty((Package *)object))
+	{
+		if (!isObjectChangedInUpperTrans(object) && !dlist_is_empty(changesStack))
+		{
+			createSavepoint(object, type);
+			addToChangesStackUpperLevel(object, type);
+			GetActualState(object)->level = GetCurrentTransactionNestLevel() - 1;
+		}
+		GetActualState(object)->is_valid = false;
 	}
 }
 
@@ -1840,9 +1856,9 @@ addToChangesStackUpperLevel(TransObject *object, TransObjectType type)
 	ChangedObject *co_new;
 	ChangesStackNode *csn;
 	/*
-		* Impossible to push in upper list existing node
-		* because it was created in another context
-		*/
+	 * Impossible to push in upper list existing node
+	 * because it was created in another context
+	 */
 	csn = dlist_head_element(ChangesStackNode, node, changesStack);
 	co_new = makeChangedObject(object, csn->ctx);
 	dlist_push_head(type == TRANS_PACKAGE ? csn->changedPacksList :
