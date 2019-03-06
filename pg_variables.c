@@ -1355,7 +1355,7 @@ initObjectHistory(TransObject *object, TransObjectType type)
 			VarState * varState = (VarState *) state;
 			ScalarVar  *scalar = &(varState->value.scalar);
 
-			get_typlenbyval(variable->typid, &scalar->typlen, 
+			get_typlenbyval(variable->typid, &scalar->typlen,
 							&scalar->typbyval);
 			varState->value.scalar.is_null = true;
 		}
@@ -1611,7 +1611,7 @@ createVariableInternal(Package *package, text *name, Oid typid, bool is_record,
 		(!found || !GetActualState(variable)->is_valid))
 		GetPackState(package)->trans_var_num++;
 	GetActualState(variable)->is_valid = true;
-	
+
 	/* If it is necessary, put variable to changedVars */
 	if (is_transactional)
 		addToChangesStack(transObject, TRANS_VARIABLE);
@@ -1777,35 +1777,50 @@ rollbackSavepoint(TransObject *object, TransObjectType type)
 	state = GetActualState(object);
 	removeState(object, type, state);
 
-	/* If there is no more states... */
-	if (dlist_is_empty(&object->states))
+	if (type == TRANS_PACKAGE)
 	{
-		/* ...but object is a package and has some regular variables... */
-		if (type == TRANS_PACKAGE && numOfRegVars((Package *)object) > 0)
+		/* If there is no more states... */
+		if (dlist_is_empty(&object->states))
 		{
-			/* ...create a new state to make package valid. */
-			initObjectHistory(object, type);
-			GetActualState(object)->level = GetCurrentTransactionNestLevel() - 1;
-			if (!dlist_is_empty(changesStack))
+			/* ...but object is a package and has some regular variables... */
+			if (numOfRegVars((Package *)object) > 0)
+			{
+				/* ...create a new state to make package valid. */
+				initObjectHistory(object, type);
+				GetActualState(object)->level = GetCurrentTransactionNestLevel() - 1;
+				if (!dlist_is_empty(changesStack))
+					addToChangesStackUpperLevel(object, type);
+			}
+			else
+				/* ...or remove an object if it is no longer needed. */
+				removeObject(object, type);
+		}
+		/*
+		* But if a package has more states, but hasn't valid variables,
+		* mark it as not valid or remove at top level transaction.
+		*/
+		else if (isPackageEmpty((Package *)object))
+		{
+			if (dlist_is_empty(changesStack))
+			{
+				removeObject(object, type);
+				return;
+			}
+			else if (!isObjectChangedInUpperTrans(object) &&
+					 !dlist_is_empty(changesStack))
+			{
+				createSavepoint(object, type);
 				addToChangesStackUpperLevel(object, type);
+				GetActualState(object)->level = GetCurrentTransactionNestLevel() - 1;
+			}
+			GetActualState(object)->is_valid = false;
 		}
-		else
-			/* ...or remove an object if it is no longer needed. */
-			removeObject(object, type);
 	}
-	/* 
-	 * But if a package has more states, but hasn't valid variables,
-	 * mark it as not valid.
-	 */
-	else if (type == TRANS_PACKAGE && isPackageEmpty((Package *)object))
+	else
 	{
-		if (!isObjectChangedInUpperTrans(object) && !dlist_is_empty(changesStack))
-		{
-			createSavepoint(object, type);
-			addToChangesStackUpperLevel(object, type);
-			GetActualState(object)->level = GetCurrentTransactionNestLevel() - 1;
-		}
-		GetActualState(object)->is_valid = false;
+		if (dlist_is_empty(&object->states))
+			/* Remove a variable if it is no longer needed. */
+			removeObject(object, type);
 	}
 }
 
@@ -1891,13 +1906,14 @@ isObjectChangedInUpperTrans(TransObject *object)
 			   *prev_state;
 
 	cur_state = GetActualState(object);
-	if (dlist_has_next(&object->states, &cur_state->node))
+	if (dlist_has_next(&object->states, &cur_state->node) &&
+		cur_state->level == GetCurrentTransactionNestLevel())
 	{
 		prev_state = dlist_container(TransState, node, cur_state->node.next);
 		return prev_state->level == GetCurrentTransactionNestLevel() - 1;
 	}
-
-	return false;
+	else
+		return cur_state->level == GetCurrentTransactionNestLevel() - 1;
 }
 
 /*
